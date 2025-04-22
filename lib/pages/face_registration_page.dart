@@ -483,17 +483,30 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> with Widget
         request.fields['employeeId'] = _employeeIdController.text;
         request.fields['name'] = _nameController.text;
         
-        // Add face images
+        // Add face images - handle differently for web and mobile
         for (var direction in _faceCaptures.keys) {
           final file = _faceCaptures[direction]!;
           if (file.path.isNotEmpty) {
-            request.files.add(
-              await http.MultipartFile.fromPath(
-                'faceImages', 
-                file.path,
-                filename: 'face_$direction.jpg',
-              ),
-            );
+            if (kIsWeb) {
+              // For web, read the bytes from XFile and create a MultipartFile from bytes
+              final bytes = await file.readAsBytes();
+              request.files.add(
+                http.MultipartFile.fromBytes(
+                  'faceImages',
+                  bytes,
+                  filename: 'face_$direction.jpg',
+                ),
+              );
+            } else {
+              // For mobile, use path-based approach
+              request.files.add(
+                await http.MultipartFile.fromPath(
+                  'faceImages', 
+                  file.path,
+                  filename: 'face_$direction.jpg',
+                ),
+              );
+            }
           }
         }
         
@@ -520,6 +533,7 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> with Widget
           _feedbackMessage = 'Error sending data: $e';
           _isProcessing = false;
         });
+        print('Error details: $e');
       }
     }
   }
