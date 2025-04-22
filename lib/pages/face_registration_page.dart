@@ -487,8 +487,8 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> with Widget
         for (var direction in _faceCaptures.keys) {
           final file = _faceCaptures[direction]!;
           if (file.path.isNotEmpty) {
+            // For web, we need to read the bytes directly since file paths don't work
             if (kIsWeb) {
-              // For web, read the bytes from XFile and create a MultipartFile from bytes
               final bytes = await file.readAsBytes();
               request.files.add(
                 http.MultipartFile.fromBytes(
@@ -498,7 +498,7 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> with Widget
                 ),
               );
             } else {
-              // For mobile, use path-based approach
+              // For mobile, we can use the file path
               request.files.add(
                 await http.MultipartFile.fromPath(
                   'faceImages', 
@@ -533,7 +533,6 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> with Widget
           _feedbackMessage = 'Error sending data: $e';
           _isProcessing = false;
         });
-        print('Error details: $e');
       }
     }
   }

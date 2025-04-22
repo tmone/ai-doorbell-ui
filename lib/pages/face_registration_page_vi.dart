@@ -483,17 +483,30 @@ class _FaceRegistrationPageVIState extends State<FaceRegistrationPageVI> with Wi
         request.fields['employeeId'] = _employeeIdController.text;
         request.fields['name'] = _nameController.text;
         
-        // Thêm hình ảnh khuôn mặt
+        // Thêm hình ảnh khuôn mặt - xử lý khác nhau cho web và mobile
         for (var direction in _faceCaptures.keys) {
           final file = _faceCaptures[direction]!;
           if (file.path.isNotEmpty) {
-            request.files.add(
-              await http.MultipartFile.fromPath(
-                'faceImages', 
-                file.path,
-                filename: 'face_$direction.jpg',
-              ),
-            );
+            // Đối với web, cần đọc trực tiếp bytes vì file path không hoạt động
+            if (kIsWeb) {
+              final bytes = await file.readAsBytes();
+              request.files.add(
+                http.MultipartFile.fromBytes(
+                  'faceImages',
+                  bytes,
+                  filename: 'face_$direction.jpg',
+                ),
+              );
+            } else {
+              // Đối với mobile, có thể sử dụng file path
+              request.files.add(
+                await http.MultipartFile.fromPath(
+                  'faceImages', 
+                  file.path,
+                  filename: 'face_$direction.jpg',
+                ),
+              );
+            }
           }
         }
         
