@@ -2,6 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:http/http.dart' as http;
 import 'package:permission_handler/permission_handler.dart';
+import 'dart:async';
+import 'package:google_ml_kit/google_ml_kit.dart';
+import 'dart:io';
+import 'dart:math' as math;
+import 'dart:ui' show ImageByteFormat;
+import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 
 class FaceRegistrationPage extends StatefulWidget {
   final List<CameraDescription> cameras;
@@ -12,7 +19,7 @@ class FaceRegistrationPage extends StatefulWidget {
   State<FaceRegistrationPage> createState() => _FaceRegistrationPageState();
 }
 
-class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
+class _FaceRegistrationPageState extends State<FaceRegistrationPage> with WidgetsBindingObserver {
   late CameraController _cameraController;
   bool _isCameraInitialized = false;
   bool _isFrontCameraSelected = true;
@@ -20,6 +27,33 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
   bool _isProcessing = false;
   bool _isCompleted = false;
   String _feedbackMessage = '';
+  Timer? _captureTimer;
+  int _countdownSeconds = 3;
+  bool _isAutoCaptureActive = false;
+  bool _processingImage = false;
+  
+  // Face detector instance - only for mobile platforms
+  FaceDetector? _faceDetector;
+  
+  // Web simulation variables
+  Timer? _webSimulationTimer;
+  int _webCurrentDirection = 0;
+  final List<String> _webDirections = ['front', 'left', 'right', 'up', 'down'];
+  
+  // Track angles that have already been captured
+  Map<String, bool> _capturedAngles = {
+    'front': false,
+    'left': false,
+    'right': false,
+    'up': false,
+    'down': false,
+  };
+
+  // Current detected face pose
+  String _currentDetectedPose = 'unknown';
+  double _currentAngleX = 0.0;
+  double _currentAngleY = 0.0;
+  double _currentAngleZ = 0.0;
   
   // Form controllers
   final TextEditingController _employeeIdController = TextEditingController();
@@ -31,6 +65,7 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
     'front': XFile(''),
     'left': XFile(''),
     'right': XFile(''),
+    'down': XFile(''),
     'up': XFile(''),
   };
 
@@ -43,13 +78,42 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    
+    // Only initialize face detector on mobile platforms
+    if (!kIsWeb) {
+      _faceDetector = GoogleMlKit.vision.faceDetector(
+        FaceDetectorOptions(
+          enableClassification: true,
+          enableTracking: true,
+          minFaceSize: 0.1,
+          performanceMode: FaceDetectorMode.accurate
+        )
+      );
+    }
+    
     _requestCameraPermission();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // App state changed before we got the chance to initialize the camera
+    if (!_isCameraInitialized) return;
+
+    if (state == AppLifecycleState.inactive || state == AppLifecycleState.paused) {
+      // Free up memory when camera isn't active
+      _cameraController.dispose();
+      _isCameraInitialized = false;
+    } else if (state == AppLifecycleState.resumed) {
+      // Reinitialize camera with same properties
+      _initializeCamera(widget.cameras.first);
+    }
   }
 
   Future<void> _requestCameraPermission() async {
     final status = await Permission.camera.request();
     if (status.isGranted) {
-      _initializeCamera(widget.cameras.first);
+      await _initializeCamera(widget.cameras.first);
     } else {
       setState(() {
         _feedbackMessage = 'Camera permission is required for face registration.';
@@ -58,25 +122,191 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
   }
 
   Future<void> _initializeCamera(CameraDescription cameraDescription) async {
+    if (_isCameraInitialized) {
+      await _cameraController.dispose();
+    }
+    
     _cameraController = CameraController(
       cameraDescription,
-      ResolutionPreset.high,
+      ResolutionPreset.medium, // Changed from high to medium for better performance
       enableAudio: false,
+      imageFormatGroup: kIsWeb ? ImageFormatGroup.jpeg : (Platform.isAndroid 
+          ? ImageFormatGroup.nv21
+          : ImageFormatGroup.bgra8888),
     );
 
     try {
       await _cameraController.initialize();
+      
+      if (!mounted) return;
+      
+      if (!kIsWeb) {
+        // Start image stream for real-time face detection on mobile
+        await _cameraController.startImageStream(_processCameraImage);
+      }
+      
       setState(() {
         _isCameraInitialized = true;
       });
     } catch (e) {
       setState(() {
         _feedbackMessage = 'Error initializing camera: $e';
+        _isCameraInitialized = false;
+      });
+      print('Error initializing camera: $e');
+    }
+  }
+  
+  Future<void> _processCameraImage(CameraImage cameraImage) async {
+    // Skip processing on web platform
+    if (kIsWeb || _processingImage || !_isAutoCaptureActive || _isCapturing || _isCompleted || !mounted) {
+      return;
+    }
+    
+    _processingImage = true;
+    
+    try {
+      final WriteBuffer allBytes = WriteBuffer();
+      for (final Plane plane in cameraImage.planes) {
+        allBytes.putUint8List(plane.bytes);
+      }
+      final bytes = allBytes.done().buffer.asUint8List();
+
+      final Size imageSize = Size(
+        cameraImage.width.toDouble(),
+        cameraImage.height.toDouble(),
+      );
+
+      // Make sure using the right camera
+      final camera = _isFrontCameraSelected
+        ? widget.cameras.firstWhere((camera) => camera.lensDirection == CameraLensDirection.front,
+            orElse: () => widget.cameras.first)
+        : widget.cameras.firstWhere((camera) => camera.lensDirection == CameraLensDirection.back,
+            orElse: () => widget.cameras.first);
+            
+      final imageRotation = InputImageRotationValue.fromRawValue(camera.sensorOrientation) ?? 
+        InputImageRotation.rotation0deg;
+
+      final inputImageFormat = InputImageFormatValue.fromRawValue(cameraImage.format.raw) ?? 
+        InputImageFormat.nv21;
+
+      final inputImage = InputImage.fromBytes(
+        bytes: bytes,
+        metadata: InputImageMetadata(
+          size: imageSize,
+          rotation: imageRotation, 
+          format: inputImageFormat,
+          bytesPerRow: cameraImage.planes[0].bytesPerRow,
+        ),
+      );
+
+      final List<Face> faces = await _faceDetector!.processImage(inputImage);
+      
+      if (!mounted) return;
+      
+      if (faces.isEmpty) {
+        setState(() {
+          _currentDetectedPose = 'no_face';
+        });
+        return;
+      }
+
+      // Process the first detected face
+      final Face face = faces.first;
+      
+      // Get face rotation angles
+      final double? headEulerAngleX = face.headEulerAngleX;
+      final double? headEulerAngleY = face.headEulerAngleY;
+      final double? headEulerAngleZ = face.headEulerAngleZ;
+      
+      // These values are only non-null when using ML Kit face detector
+      if (headEulerAngleX != null && headEulerAngleY != null && headEulerAngleZ != null) {
+        if (mounted) {
+          setState(() {
+            _currentAngleX = headEulerAngleX;
+            _currentAngleY = headEulerAngleY;
+            _currentAngleZ = headEulerAngleZ;
+          });
+          
+          // Determine face direction based on angles
+          _determineFacePose(headEulerAngleX, headEulerAngleY, headEulerAngleZ);
+
+          // Capture face if in correct position and angle hasn't been captured yet
+          _autoCaptureFaceIfReady();
+        }
+      }
+    } catch (e) {
+      // Handle error without crashing
+      print('Error processing face: $e');
+    } finally {
+      _processingImage = false;
+    }
+  }
+  
+  void _determineFacePose(double angleX, double angleY, double angleZ) {
+    // Define thresholds for different directions
+    const double frontThreshold = 15.0;
+    const double sideThreshold = 25.0;
+    const double verticalThreshold = 15.0;
+
+    // Determine direction
+    String pose = 'unknown';
+    
+    // Check front face first
+    if (angleX.abs() < frontThreshold && 
+        angleY.abs() < frontThreshold && 
+        angleZ.abs() < frontThreshold) {
+      pose = 'front';
+    }
+    // Check left/right face
+    else if (angleY.abs() > sideThreshold) {
+      pose = angleY > 0 ? 'right' : 'left';
+    }
+    // Check up/down face
+    else if (angleX.abs() > verticalThreshold) {
+      pose = angleX > 0 ? 'down' : 'up';  // X axis is inverted relative to face angle
+    }
+    
+    if (mounted) {
+      setState(() {
+        _currentDetectedPose = pose;
+        _updateCurrentCaptureDirectionBasedOnPose(pose);
       });
     }
   }
 
-  void _switchCamera() {
+  void _autoCaptureFaceIfReady() {
+    // Only proceed if auto mode is active and not capturing
+    if (!_isAutoCaptureActive || _isCapturing || _isCompleted || !mounted) {
+      return;
+    }
+
+    // Check if current pose matches what we need and hasn't been captured yet
+    if (_currentDetectedPose != 'unknown' && 
+        _currentDetectedPose != 'no_face' &&
+        !_capturedAngles[_currentDetectedPose]!) {
+      
+      // Start capture process
+      _captureImage();
+    }
+  }
+  
+  void _updateCurrentCaptureDirectionBasedOnPose(String detectedPose) {
+    // Update capture direction based on detected face pose
+    // and which angles are still missing
+    if (detectedPose != 'unknown' && detectedPose != 'no_face' && !_capturedAngles[detectedPose]!) {
+      _currentCaptureDirection = detectedPose;
+    } else {
+      // If angle has been captured or is unidentified,
+      // find the next uncaptured angle
+      List<String> missingAngles = _getMissingAngles();
+      if (missingAngles.isNotEmpty && _currentCaptureDirection == detectedPose) {
+        _currentCaptureDirection = missingAngles.first;
+      }
+    }
+  }
+
+  void _switchCamera() async {
     if (widget.cameras.length < 2) return;
 
     setState(() {
@@ -84,14 +314,95 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
       _isFrontCameraSelected = !_isFrontCameraSelected;
     });
 
-    final newCameraIndex = _isFrontCameraSelected ? 1 : 0;
-    if (newCameraIndex < widget.cameras.length) {
-      _initializeCamera(widget.cameras[newCameraIndex]);
+    if (!kIsWeb) {
+      await _cameraController.stopImageStream();
+    }
+    await _cameraController.dispose();
+
+    final newCameraIndex = _isFrontCameraSelected ? 
+      widget.cameras.indexWhere((camera) => camera.lensDirection == CameraLensDirection.front) :
+      widget.cameras.indexWhere((camera) => camera.lensDirection == CameraLensDirection.back);
+      
+    if (newCameraIndex >= 0) {
+      await _initializeCamera(widget.cameras[newCameraIndex]);
+    } else {
+      await _initializeCamera(widget.cameras.first);
     }
   }
 
+  // Web-specific implementation for face capture simulation
+  void _startWebSimulation() {
+    if (!kIsWeb || !_isAutoCaptureActive || _isCompleted) return;
+    
+    // Display initial instruction
+    setState(() {
+      _currentDetectedPose = _webDirections[_webCurrentDirection];
+      _currentCaptureDirection = _webDirections[_webCurrentDirection];
+      _feedbackMessage = 'Please position your face ${_webDirections[_webCurrentDirection]}';
+    });
+    
+    // Give user 3 seconds to position their face
+    _webSimulationTimer = Timer(const Duration(seconds: 3), () {
+      if (_isAutoCaptureActive && !_isCapturing && !_isCompleted && mounted) {
+        // Capture current angle
+        _captureImage();
+        
+        // Move to next direction if there are any left
+        _webCurrentDirection = (_webCurrentDirection + 1) % _webDirections.length;
+        
+        // Check if we need to continue
+        if (_getMissingAngles().isEmpty) {
+          setState(() {
+            _isCompleted = true;
+          });
+        } else {
+          // Schedule next capture
+          _webSimulationTimer = Timer(const Duration(seconds: 4), () {
+            if (_isAutoCaptureActive && !_isCapturing && !_isCompleted && mounted) {
+              _startWebSimulation();
+            }
+          });
+        }
+      }
+    });
+  }
+
+  // Start auto capture process
+  void _startAutoCapture() {
+    if (!_isCameraInitialized || _isCompleted) {
+      return;
+    }
+    
+    setState(() {
+      _isAutoCaptureActive = true;
+      _feedbackMessage = 'Auto-capture is active. Please follow the instructions.';
+    });
+    
+    // For web platform, use simulation instead of ML Kit
+    if (kIsWeb) {
+      _startWebSimulation();
+    }
+  }
+
+  // Stop auto capture process
+  void _stopAutoCapture() {
+    _webSimulationTimer?.cancel();
+    
+    setState(() {
+      _isAutoCaptureActive = false;
+      _feedbackMessage = 'Auto-capture paused.';
+    });
+  }
+
+  List<String> _getMissingAngles() {
+    return _faceCaptures.entries
+        .where((entry) => entry.value.path.isEmpty)
+        .map((entry) => entry.key)
+        .toList();
+  }
+
   Future<void> _captureImage() async {
-    if (!_cameraController.value.isInitialized) {
+    if (!_cameraController.value.isInitialized || _isCapturing || !mounted) {
       return;
     }
     
@@ -101,38 +412,59 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
     });
 
     try {
+      // Pause the image stream for high quality capture (mobile only)
+      if (!kIsWeb) {
+        await _cameraController.stopImageStream();
+      }
+      
+      await Future.delayed(const Duration(milliseconds: 500));
+      
       final XFile file = await _cameraController.takePicture();
+      
+      if (!mounted) return;
+      
+      // Restart image stream (mobile only)
+      if (!kIsWeb) {
+        await _cameraController.startImageStream(_processCameraImage);
+      }
+      
       setState(() {
         _faceCaptures[_currentCaptureDirection] = file;
-        _feedbackMessage = 'Image captured successfully!';
+        _capturedAngles[_currentCaptureDirection] = true;
+        _feedbackMessage = 'Capture successful!';
         
-        // Move to next angle
-        _moveToNextCaptureDirection();
+        // Check if we've captured all angles
+        if (_getMissingAngles().isEmpty) {
+          _isCompleted = true;
+          _isAutoCaptureActive = false;
+          _webSimulationTimer?.cancel();
+        } else {
+          _feedbackMessage = 'Please position your face for the next angle.';
+        }
       });
     } catch (e) {
-      setState(() {
-        _feedbackMessage = 'Error capturing image: $e';
-      });
+      print('Error capturing image: $e');
+      
+      try {
+        // Restart stream on error (mobile only)
+        if (!kIsWeb && !_cameraController.value.isStreamingImages && mounted) {
+          await _cameraController.startImageStream(_processCameraImage);
+        }
+      } catch (streamError) {
+        print('Error restarting stream: $streamError');
+      }
+      
+      if (mounted) {
+        setState(() {
+          _feedbackMessage = 'Error capturing image: $e';
+        });
+      }
     } finally {
-      setState(() {
-        _isCapturing = false;
-      });
-    }
-  }
-  
-  void _moveToNextCaptureDirection() {
-    final directions = ['front', 'left', 'right', 'up'];
-    final currentIndex = directions.indexOf(_currentCaptureDirection);
-    
-    if (currentIndex < directions.length - 1) {
-      setState(() {
-        _currentCaptureDirection = directions[currentIndex + 1];
-      });
-    } else {
-      // All images captured
-      setState(() {
-        _isCompleted = true;
-      });
+      if (mounted) {
+        setState(() {
+          _isCapturing = false;
+        });
+      }
     }
   }
 
@@ -144,7 +476,7 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
       });
 
       try {
-        // Create a multipart request
+        // Create multipart request
         var request = http.MultipartRequest('POST', Uri.parse(_apiEndpoint));
         
         // Add employee data
@@ -165,7 +497,7 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
           }
         }
         
-        // Send the request
+        // Send request
         final response = await request.send();
         
         if (response.statusCode == 201) {
@@ -174,7 +506,7 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
             _isProcessing = false;
           });
           
-          // Show success dialog
+          // Show completion dialog
           _showCompletionDialog();
         } else {
           final responseBody = await response.stream.bytesToString();
@@ -193,6 +525,16 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
   }
   
   void _resetRegistration() {
+    _captureTimer?.cancel();
+    _webSimulationTimer?.cancel();
+    _stopAutoCapture();
+    _webCurrentDirection = 0;
+    
+    // Restart stream if stopped (mobile only)
+    if (!kIsWeb && _isCameraInitialized && !_cameraController.value.isStreamingImages) {
+      _cameraController.startImageStream(_processCameraImage);
+    }
+    
     setState(() {
       _employeeIdController.clear();
       _nameController.clear();
@@ -201,9 +543,18 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
         'left': XFile(''),
         'right': XFile(''),
         'up': XFile(''),
+        'down': XFile(''),
+      };
+      _capturedAngles = {
+        'front': false,
+        'left': false,
+        'right': false,
+        'up': false,
+        'down': false,
       };
       _currentCaptureDirection = 'front';
       _isCompleted = false;
+      _isAutoCaptureActive = false;
       _feedbackMessage = '';
     });
   }
@@ -227,7 +578,7 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
             TextButton(
               onPressed: () {
                 Navigator.of(context).pop();
-                Navigator.of(context).pop(); // Return to language selection
+                Navigator.of(context).pop(); // Return to language selection page
               },
               child: const Text('Return to Home'),
             ),
@@ -243,20 +594,24 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
     
     switch (_currentCaptureDirection) {
       case 'front':
-        instruction = 'Look straight at the camera';
+        instruction = 'Look straight into the camera';
         icon = Icons.face;
         break;
       case 'left':
-        instruction = 'Turn your face slightly to the left';
+        instruction = 'Slowly turn your face to the left';
         icon = Icons.arrow_back;
         break;
       case 'right':
-        instruction = 'Turn your face slightly to the right';
+        instruction = 'Slowly turn your face to the right';
         icon = Icons.arrow_forward;
         break;
       case 'up':
-        instruction = 'Tilt your face slightly upward';
+        instruction = 'Slowly tilt your face upwards';
         icon = Icons.arrow_upward;
+        break;
+      case 'down':
+        instruction = 'Slowly tilt your face downwards';
+        icon = Icons.arrow_downward;
         break;
     }
     
@@ -277,6 +632,15 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
           'Angle: ${_currentCaptureDirection.toUpperCase()} (${_getCaptureProgress()})',
           style: const TextStyle(color: Colors.white),
         ),
+        if (_isAutoCaptureActive && _currentDetectedPose == _currentCaptureDirection)
+          const Text(
+            'Perfect! Hold this position...',
+            style: TextStyle(
+              color: Colors.green,
+              fontSize: 16.0,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
       ],
     );
   }
@@ -288,7 +652,21 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _captureTimer?.cancel();
+    _webSimulationTimer?.cancel();
+    
+    if (!kIsWeb && _cameraController.value.isStreamingImages) {
+      _cameraController.stopImageStream();
+    }
+    
     _cameraController.dispose();
+    
+    // Only close face detector on mobile platforms
+    if (!kIsWeb && _faceDetector != null) {
+      _faceDetector!.close();
+    }
+    
     _employeeIdController.dispose();
     _nameController.dispose();
     super.dispose();
@@ -309,7 +687,7 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
       ),
       body: Column(
         children: [
-          // Employee information form
+          // Employee info form
           Padding(
             padding: const EdgeInsets.all(16.0),
             child: Form(
@@ -324,7 +702,7 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
                     ),
                     validator: (value) {
                       if (value == null || value.isEmpty) {
-                        return 'Please enter your employee ID';
+                        return 'Please enter employee ID';
                       }
                       return null;
                     },
@@ -338,7 +716,7 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
                     ),
                     validator: (value) {
                       if (value == null || value.isEmpty) {
-                        return 'Please enter your full name';
+                        return 'Please enter full name';
                       }
                       return null;
                     },
@@ -348,7 +726,7 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
             ),
           ),
           
-          // Camera preview and capture section
+          // Camera preview and capture area
           Expanded(
             child: Container(
               color: Colors.black,
@@ -358,23 +736,88 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
                   if (_isCameraInitialized)
                     CameraPreview(_cameraController),
                   
-                  // Face outline guide
+                  // Face guide frame
                   Center(
                     child: Container(
                       width: 250,
                       height: 250,
                       decoration: BoxDecoration(
-                        border: Border.all(color: Colors.white, width: 2.0),
+                        border: Border.all(
+                          color: _currentDetectedPose == _currentCaptureDirection 
+                              ? Colors.green 
+                              : Colors.white, 
+                          width: _currentDetectedPose == _currentCaptureDirection ? 3.0 : 2.0
+                        ),
                         borderRadius: BorderRadius.circular(125),
                       ),
                     ),
                   ),
                   
-                  // Capture instructions
+                  // Capture guidance
                   Positioned(
                     top: 20,
                     child: _buildCaptureFeedbackWidget(),
                   ),
+                  
+                  // Debug info about face angles (mobile only)
+                  if (!kIsWeb)
+                    Positioned(
+                      top: 120,
+                      left: 20,
+                      child: Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: Colors.black54,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Detected: $_currentDetectedPose',
+                              style: const TextStyle(color: Colors.white),
+                            ),
+                            Text(
+                              'X: ${_currentAngleX.toStringAsFixed(1)}°',
+                              style: const TextStyle(color: Colors.white),
+                            ),
+                            Text(
+                              'Y: ${_currentAngleY.toStringAsFixed(1)}°',
+                              style: const TextStyle(color: Colors.white),
+                            ),
+                            Text(
+                              'Z: ${_currentAngleZ.toStringAsFixed(1)}°',
+                              style: const TextStyle(color: Colors.white),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  
+                  // Add web notice
+                  if (kIsWeb)
+                    Positioned(
+                      top: 120,
+                      child: Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: Colors.black54,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: const Column(
+                          children: [
+                            Text(
+                              'WEB MODE',
+                              style: TextStyle(color: Colors.yellow, fontWeight: FontWeight.bold),
+                            ),
+                            Text(
+                              'Please follow the prompts to move your face',
+                              style: TextStyle(color: Colors.white),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
                   
                   // Feedback message
                   if (_feedbackMessage.isNotEmpty)
@@ -389,6 +832,52 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
                         ),
                       ),
                     ),
+                    
+                  // List of captured and needed angles
+                  Positioned(
+                    top: 120,
+                    right: 20,
+                    child: Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: Colors.black54,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Capture Status:',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          ..._faceCaptures.entries.map((entry) {
+                            bool isCaptured = entry.value.path.isNotEmpty;
+                            return Row(
+                              children: [
+                                Icon(
+                                  isCaptured ? Icons.check_circle : Icons.radio_button_unchecked,
+                                  color: isCaptured ? Colors.green : Colors.white,
+                                  size: 16,
+                                ),
+                                const SizedBox(width: 4),
+                                Text(
+                                  entry.key.toUpperCase(),
+                                  style: TextStyle(
+                                    color: isCaptured ? Colors.green : Colors.white,
+                                    fontWeight: isCaptured ? FontWeight.bold : FontWeight.normal,
+                                  ),
+                                ),
+                              ],
+                            );
+                          }).toList(),
+                        ],
+                      ),
+                    ),
+                  ),
                 ],
               ),
             ),
@@ -401,16 +890,29 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage> {
               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
                 if (!_isCompleted)
-                  Expanded(
-                    child: ElevatedButton.icon(
-                      onPressed: _isCapturing ? null : _captureImage,
-                      icon: const Icon(Icons.camera),
-                      label: Text(_isCapturing ? 'Capturing...' : 'Capture Face'),
-                      style: ElevatedButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(vertical: 12),
-                      ),
-                    ),
-                  )
+                  _isAutoCaptureActive
+                    ? Expanded(
+                        child: ElevatedButton.icon(
+                          onPressed: _stopAutoCapture,
+                          icon: const Icon(Icons.stop),
+                          label: const Text('Stop Auto-Capture'),
+                          style: ElevatedButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(vertical: 12),
+                            backgroundColor: Colors.orange,
+                          ),
+                        ),
+                      )
+                    : Expanded(
+                        child: ElevatedButton.icon(
+                          onPressed: _startAutoCapture,
+                          icon: const Icon(Icons.play_arrow),
+                          label: const Text('Start Auto-Capture'),
+                          style: ElevatedButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(vertical: 12),
+                            backgroundColor: Colors.blue,
+                          ),
+                        ),
+                      )
                 else
                   Expanded(
                     child: ElevatedButton.icon(
