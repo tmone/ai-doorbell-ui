@@ -5,8 +5,6 @@ import 'package:permission_handler/permission_handler.dart';
 import 'dart:async';
 import 'package:google_ml_kit/google_ml_kit.dart';
 import 'dart:io';
-import 'dart:math' as math;
-import 'dart:ui' show ImageByteFormat;
 import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 
@@ -28,7 +26,7 @@ class _FaceRegistrationPageVIState extends State<FaceRegistrationPageVI> with Wi
   bool _isCompleted = false;
   String _feedbackMessage = '';
   Timer? _captureTimer;
-  int _countdownSeconds = 3;
+  final int _countdownSeconds = 3;
   bool _isAutoCaptureActive = false;
   bool _processingImage = false;
   
@@ -897,7 +895,7 @@ class _FaceRegistrationPageVIState extends State<FaceRegistrationPageVI> with Wi
                                 ),
                               ],
                             );
-                          }).toList(),
+                          }),
                         ],
                       ),
                     ),
